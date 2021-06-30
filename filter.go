@@ -120,6 +120,7 @@ func (f *DiskClassicFilter) Add(b []byte) {
 		return offsets[i] < offsets[j]
 	})
 	f.file.mu.Lock()
+	defer f.file.mu.Unlock()
 	for _, offset := range offsets {
 		var b [1]byte
 		pos := int64(offset / 8)
@@ -127,7 +128,6 @@ func (f *DiskClassicFilter) Add(b []byte) {
 		b[0] |= 1 << (offset % 8)
 		f.file.f.WriteAt(b[:], pos)
 	}
-	f.file.mu.Unlock()
 }
 
 // Exist returns if an entry is in the filter
@@ -142,6 +142,7 @@ func (f *DiskClassicFilter) Exist(b []byte) bool {
 		return offsets[i] < offsets[j]
 	})
 	f.file.mu.Lock()
+	defer f.file.mu.Unlock()
 	for _, offset := range offsets {
 		var b [1]byte
 		pos := int64(offset / 8)
@@ -150,12 +151,11 @@ func (f *DiskClassicFilter) Exist(b []byte) bool {
 			return false
 		}
 	}
-	f.file.mu.Unlock()
 	return true
 }
 
 // ExistOrAdd costs less than continuously invoking Exist and Add, and returns whether the entry was in the filter before.
-func (f *DiskClassicFilter) ExistOrAdd(b []byte) bool {
+func (f *DiskClassicFilter) ExistOrAdd(b []byte) (exist bool) {
 	x, y := f.h(b)
 	var offsets []uint64
 	var newVals [][]byte
@@ -168,20 +168,25 @@ func (f *DiskClassicFilter) ExistOrAdd(b []byte) bool {
 	})
 	newVals = make([][]byte, len(offsets))
 	f.file.mu.Lock()
+	defer f.file.mu.Unlock()
+	exist = true
 	for i, offset := range offsets {
 		var b [1]byte
 		pos := int64(offset / 8)
 		f.file.f.ReadAt(b[:], pos)
 		if b[0]&(1<<(offset%8)) == 0 {
-			return true
+			exist = false
+			break
 		}
 		newVals[i] = []byte{b[0] | 1<<(offset%8)}
+	}
+	if exist {
+		return
 	}
 	for i, offset := range offsets {
 		f.file.f.WriteAt(newVals[i], int64(offset/8))
 	}
-	f.file.mu.Unlock()
-	return false
+	return
 }
 
 // Size returns the size of the filter in bytes
