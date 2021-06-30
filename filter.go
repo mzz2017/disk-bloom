@@ -1,7 +1,7 @@
 // Based on github.com/riobard/go-bloom
 // Apache License 2.0
 
-package disk_bloom_filter
+package bloom
 
 import (
 	"math"
