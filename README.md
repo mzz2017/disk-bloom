@@ -1,6 +1,6 @@
 # disk-bloom-filter
 
-Operate the bloom filter on the disk for long-term anti-replay protection.
+Disk-based bloom filter. It operates the bloom filter on the disk for long-term anti-replay protection.
 
 ```golang
 func doubleFNV(b []byte) (uint64, uint64) {
@@ -13,14 +13,23 @@ func doubleFNV(b []byte) (uint64, uint64) {
     return x, y
 }
 
-bf, err := bloom.New("example.dbf", bloom.FsyncModeEverySec, 1000000, 0.0001, doubleFNV)
+const (
+    n         = 1e6
+    expectFPR = 1e-4
+)
+
+bf, err := disk_bloom.NewGroup("testfile*", disk_bloom.FsyncModeEverySec, n, expectFPR, doubleFNV)
 if err != nil {
     panic(err)
 }
-bf.Add([]byte("hello"))
+bf.ExistOrAdd([]byte("hello"))
 bf.Exist([]byte("hello"))
 bf.ExistOrAdd([]byte("world"))
 ```
+
+## Related
+
++ https://github.com/shadowsocks/shadowsocks-rust/pull/556
 
 ## Thanks
 

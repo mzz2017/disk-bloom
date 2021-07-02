@@ -1,4 +1,4 @@
-package bloom
+package disk_bloom
 
 import (
 	"encoding/binary"
@@ -23,11 +23,11 @@ type filterObj struct {
 }
 
 // |added entries(8)|expected max entries(8)|slots(1)|bits(8)|
-type metadata struct {
-	added    uint64
-	expected uint64
-	slots    uint8
-	bits     uint64
+type Metadata struct {
+	Added    uint64
+	Expected uint64
+	Slots    uint8
+	Bits     uint64
 }
 
 func (o *filterObj) control(f *os.File, modified bool) {
@@ -40,13 +40,23 @@ func (o *filterObj) control(f *os.File, modified bool) {
 	f.WriteAt(b[:], LenOfMetadataSize)
 }
 
-func parseMetadata(bMetadata []byte) metadata {
-	return metadata{
-		added:    binary.LittleEndian.Uint64(bMetadata[:8]),
-		expected: binary.LittleEndian.Uint64(bMetadata[8:16]),
-		slots:    bMetadata[16],
-		bits:     binary.LittleEndian.Uint64(bMetadata[17:]),
+func parseMetadata(bMetadata []byte) Metadata {
+	return Metadata{
+		Added:    binary.LittleEndian.Uint64(bMetadata[:8]),
+		Expected: binary.LittleEndian.Uint64(bMetadata[8:16]),
+		Slots:    bMetadata[16],
+		Bits:     binary.LittleEndian.Uint64(bMetadata[17:]),
 	}
+}
+
+func (m Metadata) Encode() []byte {
+	//|added entries(8)|expected max entries(8)|slots(1)|bits(8)|
+	var b [metadataSize]byte
+	binary.LittleEndian.PutUint64(b[:], m.Added)
+	binary.LittleEndian.PutUint64(b[8:], m.Expected)
+	b[16] = m.Slots
+	binary.LittleEndian.PutUint64(b[17:], m.Bits)
+	return b[:]
 }
 
 // FilterGroup manages a group of DiskFilter.
@@ -66,17 +76,20 @@ type FilterGroup struct {
 // n is the expected number of entries in single file.
 // p is the expected false positive rate.
 func NewGroup(pattern string, fsync FsyncMode, n uint64, p float64, hash func([]byte) (uint64, uint64)) (*FilterGroup, error) {
-	g := new(FilterGroup)
-	if err := g.resolveAndSearchPattern(pattern, fsync, hash); err != nil {
+	slots, bits := OptimalParam(n, p)
+	g := &FilterGroup{
+		fsync: fsync,
+		n:     n,
+		param: FilterParam{
+			Slots: slots,
+			Bits:  bits,
+			Hash:  hash,
+		},
+	}
+	if err := g.resolvePatternAndSearch(pattern, fsync, hash); err != nil {
 		return nil, err
 	}
 
-	slots, bits := OptimalParam(n, p)
-	g.param = FilterParam{
-		Slots: slots,
-		Bits:  bits,
-		Hash:  hash,
-	}
 	if len(g.filters) == 0 || g.filters[len(g.filters)-1].added >= g.filters[len(g.filters)-1].expected {
 		// last filter is full
 		g.mu.Lock()
@@ -89,6 +102,7 @@ func NewGroup(pattern string, fsync FsyncMode, n uint64, p float64, hash func([]
 }
 
 func (g *FilterGroup) appendNewFilter() error {
+	log.Println("!!")
 	obj := new(filterObj)
 	if filter, err := New(
 		g.nextFilename(),
@@ -96,10 +110,15 @@ func (g *FilterGroup) appendNewFilter() error {
 			Fsync:        g.fsync,
 			MetadataSize: metadataSize,
 			Control:      obj.control,
-			GetParam: func(metadata []byte) FilterParam {
+			GetParam: func(metadata []byte) (param FilterParam, updatedMetadata []byte) {
 				obj.added = 0
 				obj.expected = g.n
-				return g.param
+				return g.param, Metadata{
+					Added:    0,
+					Expected: g.n,
+					Slots:    g.param.Slots,
+					Bits:     g.param.Bits,
+				}.Encode()
 			},
 		},
 	); err != nil {
@@ -111,7 +130,7 @@ func (g *FilterGroup) appendNewFilter() error {
 	return nil
 }
 
-func (g *FilterGroup) resolveAndSearchPattern(pattern string, fsync FsyncMode, hash func([]byte) (uint64, uint64)) error {
+func (g *FilterGroup) resolvePatternAndSearch(pattern string, fsync FsyncMode, hash func([]byte) (uint64, uint64)) error {
 	starIndex := strings.LastIndex(pattern, "*")
 	if starIndex == -1 {
 		return InvalidPatternErr
@@ -120,6 +139,9 @@ func (g *FilterGroup) resolveAndSearchPattern(pattern string, fsync FsyncMode, h
 		return fmt.Sprintf("%v%v%v", pattern[:starIndex], len(g.filters), pattern[starIndex+1:])
 	}
 	for {
+		if _, err := os.Stat(g.nextFilename()); os.IsNotExist(err) {
+			return nil
+		}
 		obj := new(filterObj)
 		if filter, err := New(
 			g.nextFilename(),
@@ -127,15 +149,15 @@ func (g *FilterGroup) resolveAndSearchPattern(pattern string, fsync FsyncMode, h
 				Fsync:        fsync,
 				MetadataSize: metadataSize,
 				Control:      obj.control,
-				GetParam: func(metadata []byte) FilterParam {
+				GetParam: func(metadata []byte) (FilterParam, []byte) {
 					m := parseMetadata(metadata)
-					obj.added = m.added
-					obj.expected = m.expected
+					obj.added = m.Added
+					obj.expected = m.Expected
 					return FilterParam{
-						Slots: m.slots,
-						Bits:  m.bits,
+						Slots: m.Slots,
+						Bits:  m.Bits,
 						Hash:  hash,
-					}
+					}, nil
 				},
 			},
 		); err != nil {
@@ -152,11 +174,20 @@ func (g *FilterGroup) resolveAndSearchPattern(pattern string, fsync FsyncMode, h
 }
 
 // ExistOrAdd returns whether the entry was in the filter, and adds an entry to the filterGroup if it was not in.
+// TODO: batch?
 func (g *FilterGroup) ExistOrAdd(b []byte) (exist bool) {
 	defer func() {
-		if exist == false && g.filters[len(g.filters)-1].added >= g.filters[len(g.filters)-1].expected {
+		if exist == false {
 			g.mu.Lock()
 			defer g.mu.Unlock()
+			g.filters[len(g.filters)-1].added++
+			if g.filters[len(g.filters)-1].added%1e5 == 0 {
+				log.Println(g.filters[len(g.filters)-1].added, g.filters[len(g.filters)-1].expected)
+			}
+			if g.filters[len(g.filters)-1].added < g.filters[len(g.filters)-1].expected {
+				return
+			}
+			log.Println("!!", g.filters[len(g.filters)-1].added, g.filters[len(g.filters)-1].expected)
 			if err := g.appendNewFilter(); err != nil {
 				log.Println("[error] ExistOrAdd: appendNewFilter:", err)
 			}

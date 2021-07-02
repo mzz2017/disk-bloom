@@ -1,7 +1,7 @@
 // Based on github.com/riobard/go-bloom
 // Apache License 2.0
 
-package bloom
+package disk_bloom
 
 import (
 	"encoding/binary"
@@ -59,7 +59,7 @@ type Controller struct {
 	// GetParam will be invoked when New.
 	//
 	// | len of metadata size(2 bytes) | metadata | bloom filter |
-	GetParam func(metadata []byte) FilterParam
+	GetParam func(metadata []byte) (param FilterParam, updatedMetadata []byte)
 }
 
 // n is the expected number of entries.
@@ -85,8 +85,9 @@ func New(filename string, controller Controller) (*DiskFilter, error) {
 	}
 	var param FilterParam
 	var metadataSize [LenOfMetadataSize]byte
+	var updatedMetadata []byte
 	if n, err := f.ReadAt(metadataSize[:], 0); n == 0 && err == io.EOF {
-		param = controller.GetParam(nil)
+		param, updatedMetadata = controller.GetParam(nil)
 		// create a new file
 		// write at the end of file to allocate specific space in the disk
 		// TODO: thick provision?
@@ -107,7 +108,15 @@ func New(filename string, controller Controller) (*DiskFilter, error) {
 		if _, err := f.ReadAt(metadata[:], 2); err != nil {
 			return nil, err
 		}
-		param = controller.GetParam(metadata)
+		param, updatedMetadata = controller.GetParam(metadata)
+	}
+	if updatedMetadata != nil {
+		if len(updatedMetadata) != int(controller.MetadataSize) {
+			return nil, fmt.Errorf("%w: length of updated metadata can not satisfy", InconsistentMetadataSizeErr)
+		}
+		if _, err = f.WriteAt(updatedMetadata, LenOfMetadataSize); err != nil {
+			return nil, err
+		}
 	}
 	filter := DiskFilter{
 		param:      &param,
@@ -149,11 +158,7 @@ func (f *DiskFilter) eventEverySec() {
 		default:
 		}
 		f.file.mu.Lock()
-	nextJudge:
-		if f.file.fsync == FsyncModeEverySec {
-			if !f.file.modified {
-				continue nextJudge
-			}
+		if f.file.fsync == FsyncModeEverySec && f.file.modified {
 			f.file.modified = false
 			_ = f.file.f.Sync()
 		}
@@ -165,7 +170,7 @@ func (f *DiskFilter) eventEverySec() {
 }
 
 func (f *DiskFilter) bloomOffset(x, y uint64, i int) uint64 {
-	return (x + uint64(i)*y) % (f.param.Bits / 8)
+	return (x + uint64(i)*y) % f.param.Bits
 }
 
 // fileOffset returns the fileOffset relative to the beginning of the file
@@ -219,7 +224,6 @@ func (f *DiskFilter) ExistOrAdd(b []byte) (exist bool) {
 		f.file.f.ReadAt(b[:], pos)
 		if b[0]&(1<<(offset%8)) == 0 {
 			exist = false
-			break
 		}
 		newVals[i] = []byte{b[0] | 1<<(offset%8)}
 	}
