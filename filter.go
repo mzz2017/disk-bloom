@@ -4,6 +4,9 @@
 package bloom
 
 import (
+	"encoding/binary"
+	"fmt"
+	"io"
 	"math"
 	"os"
 	"sort"
@@ -19,61 +22,107 @@ const (
 	FsyncModeNo
 )
 
+const LenOfMetadataSize = 2
+
 type muFile struct {
-	f     *os.File
-	fsync FsyncMode
-	mu    sync.Mutex
+	f        *os.File
+	fsync    FsyncMode
+	modified bool
+	mu       sync.Mutex
 }
 
+var InconsistentMetadataSizeErr = fmt.Errorf("inconsistent metadata size")
+
 // Disk-based Classic Bloom Filter
-type DiskClassicFilter struct {
-	k    int
-	m    int64
-	h    func([]byte) (uint64, uint64)
-	file muFile
+type DiskFilter struct {
+	param *FilterParam
+	file  muFile
 	// use this channel to inform the sync goroutine
-	closed chan struct{}
+	closed     chan struct{}
+	controller *Controller
+}
+
+type FilterParam struct {
+	Slots uint8
+	Bits  uint64
+	Hash  func([]byte) (uint64, uint64)
+}
+
+type Controller struct {
+	Fsync FsyncMode
+	// Size in bytes
+	MetadataSize uint16
+	// Control will be invoked every second.
+	//
+	// | len of metadata size(2 bytes) | metadata | bloom filter |
+	Control func(f *os.File, modified bool)
+	// GetParam will be invoked when New.
+	//
+	// | len of metadata size(2 bytes) | metadata | bloom filter |
+	GetParam func(metadata []byte) FilterParam
+}
+
+// n is the expected number of entries.
+// p is the expected false positive rate.
+func OptimalParam(n uint64, p float64) (slots uint8, bits uint64) {
+	k := -math.Log(p) * math.Log2E   // number of hashes
+	m := float64(n) * k * math.Log2E // number of bits
+	return uint8(k + 0.5), uint64(m)
 }
 
 // New creates a classic Bloom Filter.
-// n is the expected number of entries.
-// p is the expected false positive rate.
 // h is a double hash that takes an entry and returns two different hashes.
-func New(path string, fsync FsyncMode, n int, p float64, h func([]byte) (uint64, uint64)) (*DiskClassicFilter, error) {
+func New(filename string, controller Controller) (*DiskFilter, error) {
 	// calculate the optimal num of bits
-	k := -math.Log(p) * math.Log2E   // number of hashes
-	m := float64(n) * k * math.Log2E // number of bits
 	mode := os.O_CREATE | os.O_RDWR
 	// open the data file
-	if fsync == FsyncModeAlways {
+	if controller.Fsync == FsyncModeAlways {
 		mode |= os.O_SYNC
 	}
-	f, err := os.OpenFile(path, mode, 0644)
+	f, err := os.OpenFile(filename, mode, 0644)
 	if err != nil {
 		return nil, err
 	}
-	filter := DiskClassicFilter{
-		k:      int(k + 0.5), // rounding
-		m:      int64(m),
-		h:      h,
-		file:   muFile{f: f},
-		closed: make(chan struct{}),
-	}
-	// write at the end of file to allocate specific space in the disk
-	// TODO: thick provision?
-	_, err = f.WriteAt([]byte{0}, filter.m/8)
-	if err != nil {
+	var param FilterParam
+	var metadataSize [LenOfMetadataSize]byte
+	if n, err := f.ReadAt(metadataSize[:], 0); n == 0 && err == io.EOF {
+		param = controller.GetParam(nil)
+		// create a new file
+		// write at the end of file to allocate specific space in the disk
+		// TODO: thick provision?
+		if _, err = f.WriteAt([]byte{0}, LenOfMetadataSize+int64(controller.MetadataSize)+int64(param.Bits/8)); err != nil {
+			return nil, err
+		}
+		// write the metadata size at the head of file (2 bytes).
+		binary.LittleEndian.PutUint16(metadataSize[:], controller.MetadataSize)
+		if _, err = f.WriteAt(metadataSize[:], 0); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
 		return nil, err
+	} else if fms := binary.LittleEndian.Uint16(metadataSize[:]); fms != controller.MetadataSize {
+		return nil, fmt.Errorf("%w: the metadata size written in the given file is %v, which is different from %v", InconsistentMetadataSizeErr, fms, controller.MetadataSize)
+	} else {
+		metadata := make([]byte, controller.MetadataSize)
+		if _, err := f.ReadAt(metadata[:], 2); err != nil {
+			return nil, err
+		}
+		param = controller.GetParam(metadata)
 	}
-	switch fsync {
-	case FsyncModeEverySec:
-		go filter.syncEverySec()
+	filter := DiskFilter{
+		param:      &param,
+		file:       muFile{f: f},
+		controller: &controller,
+		closed:     make(chan struct{}),
+	}
+	if controller.Fsync == FsyncModeEverySec || controller.Control != nil {
+		go filter.eventEverySec()
 	}
 	return &filter, nil
 }
 
 // Close should be invoked if the filter is not needed anymore
-func (f *DiskClassicFilter) Close() error {
+func (f *DiskFilter) Close() error {
 	select {
 	case <-f.closed:
 		return nil
@@ -82,14 +131,15 @@ func (f *DiskClassicFilter) Close() error {
 	close(f.closed)
 	f.file.mu.Lock()
 	defer f.file.mu.Unlock()
-	if f.file.fsync != FsyncModeAlways {
+	if f.file.fsync != FsyncModeAlways && f.file.modified {
+		f.file.modified = false
 		_ = f.file.f.Sync()
 	}
 	_ = f.file.f.Close()
 	return nil
 }
 
-func (f *DiskClassicFilter) syncEverySec() {
+func (f *DiskFilter) eventEverySec() {
 	ticker := time.NewTicker(1 * time.Second)
 	for range ticker.C {
 		select {
@@ -99,43 +149,36 @@ func (f *DiskClassicFilter) syncEverySec() {
 		default:
 		}
 		f.file.mu.Lock()
-		_ = f.file.f.Sync()
+	nextJudge:
+		if f.file.fsync == FsyncModeEverySec {
+			if !f.file.modified {
+				continue nextJudge
+			}
+			f.file.modified = false
+			_ = f.file.f.Sync()
+		}
+		if f.controller.Control != nil {
+			f.controller.Control(f.file.f, f.file.modified)
+		}
 		f.file.mu.Unlock()
 	}
 }
 
-func (f *DiskClassicFilter) getOffset(x, y uint64, i int) uint64 {
-	return (x + uint64(i)*y) % (uint64(f.m))
+func (f *DiskFilter) bloomOffset(x, y uint64, i int) uint64 {
+	return (x + uint64(i)*y) % (f.param.Bits / 8)
 }
 
-// Add adds an entry to the filter
-func (f *DiskClassicFilter) Add(b []byte) {
-	x, y := f.h(b)
-	var offsets []uint64
-	for i := 0; i < f.k; i++ {
-		offsets = append(offsets, f.getOffset(x, y, i))
-	}
-	// sort to improve the performance on HDD
-	sort.Slice(offsets, func(i, j int) bool {
-		return offsets[i] < offsets[j]
-	})
-	f.file.mu.Lock()
-	defer f.file.mu.Unlock()
-	for _, offset := range offsets {
-		var b [1]byte
-		pos := int64(offset / 8)
-		f.file.f.ReadAt(b[:], pos)
-		b[0] |= 1 << (offset % 8)
-		f.file.f.WriteAt(b[:], pos)
-	}
+// fileOffset returns the fileOffset relative to the beginning of the file
+func (f *DiskFilter) fileOffset(bloomOffset int64) int64 {
+	return LenOfMetadataSize + int64(f.controller.MetadataSize) + bloomOffset
 }
 
 // Exist returns if an entry is in the filter
-func (f *DiskClassicFilter) Exist(b []byte) bool {
-	x, y := f.h(b)
+func (f *DiskFilter) Exist(b []byte) bool {
+	x, y := f.param.Hash(b)
 	var offsets []uint64
-	for i := 0; i < f.k; i++ {
-		offsets = append(offsets, f.getOffset(x, y, i))
+	for i := 0; i < int(f.param.Slots); i++ {
+		offsets = append(offsets, f.bloomOffset(x, y, i))
 	}
 	// sort to improve the performance on HDD
 	sort.Slice(offsets, func(i, j int) bool {
@@ -145,7 +188,7 @@ func (f *DiskClassicFilter) Exist(b []byte) bool {
 	defer f.file.mu.Unlock()
 	for _, offset := range offsets {
 		var b [1]byte
-		pos := int64(offset / 8)
+		pos := f.fileOffset(int64(offset / 8))
 		f.file.f.ReadAt(b[:], pos)
 		if b[0]&(1<<(offset%8)) == 0 {
 			return false
@@ -154,13 +197,13 @@ func (f *DiskClassicFilter) Exist(b []byte) bool {
 	return true
 }
 
-// ExistOrAdd costs less than continuously invoking Exist and Add, and returns whether the entry was in the filter before.
-func (f *DiskClassicFilter) ExistOrAdd(b []byte) (exist bool) {
-	x, y := f.h(b)
+// ExistOrAdd returns whether the entry was in the filter, and adds an entry to the filter if it was not in.
+func (f *DiskFilter) ExistOrAdd(b []byte) (exist bool) {
+	x, y := f.param.Hash(b)
 	var offsets []uint64
 	var newVals [][]byte
-	for i := 0; i < f.k; i++ {
-		offsets = append(offsets, f.getOffset(x, y, i))
+	for i := 0; i < int(f.param.Slots); i++ {
+		offsets = append(offsets, f.bloomOffset(x, y, i))
 	}
 	// sort to improve the performance on HDD
 	sort.Slice(offsets, func(i, j int) bool {
@@ -172,7 +215,7 @@ func (f *DiskClassicFilter) ExistOrAdd(b []byte) (exist bool) {
 	exist = true
 	for i, offset := range offsets {
 		var b [1]byte
-		pos := int64(offset / 8)
+		pos := f.fileOffset(int64(offset / 8))
 		f.file.f.ReadAt(b[:], pos)
 		if b[0]&(1<<(offset%8)) == 0 {
 			exist = false
@@ -184,10 +227,20 @@ func (f *DiskClassicFilter) ExistOrAdd(b []byte) (exist bool) {
 		return
 	}
 	for i, offset := range offsets {
-		f.file.f.WriteAt(newVals[i], int64(offset/8))
+		pos := f.fileOffset(int64(offset / 8))
+		f.file.f.WriteAt(newVals[i], pos)
 	}
+	f.file.modified = true
 	return
 }
 
 // Size returns the size of the filter in bytes
-func (f *DiskClassicFilter) Size() int64 { return f.m / 8 }
+func (f *DiskFilter) Size() uint64 { return f.param.Bits / 8 }
+
+func (f *DiskFilter) FilterParam() FilterParam {
+	return *f.param
+}
+
+func (f *DiskFilter) Controller() Controller {
+	return *f.controller
+}
