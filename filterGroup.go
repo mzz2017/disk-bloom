@@ -102,7 +102,6 @@ func NewGroup(pattern string, fsync FsyncMode, n uint64, p float64, hash func([]
 }
 
 func (g *FilterGroup) appendNewFilter() error {
-	log.Println("!!")
 	obj := new(filterObj)
 	if filter, err := New(
 		g.nextFilename(),
@@ -181,13 +180,9 @@ func (g *FilterGroup) ExistOrAdd(b []byte) (exist bool) {
 			g.mu.Lock()
 			defer g.mu.Unlock()
 			g.filters[len(g.filters)-1].added++
-			if g.filters[len(g.filters)-1].added%1e5 == 0 {
-				log.Println(g.filters[len(g.filters)-1].added, g.filters[len(g.filters)-1].expected)
-			}
 			if g.filters[len(g.filters)-1].added < g.filters[len(g.filters)-1].expected {
 				return
 			}
-			log.Println("!!", g.filters[len(g.filters)-1].added, g.filters[len(g.filters)-1].expected)
 			if err := g.appendNewFilter(); err != nil {
 				log.Println("[error] ExistOrAdd: appendNewFilter:", err)
 			}
