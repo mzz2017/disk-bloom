@@ -9,7 +9,7 @@ import (
 	"sync"
 )
 
-const metadataSize = 32
+const metadataSize = 39
 
 var (
 	InvalidPatternErr = fmt.Errorf("invalid pattern")
@@ -22,7 +22,7 @@ type filterObj struct {
 	expected uint64
 }
 
-// |added entries(8)|expected max entries(8)|slots(1)|bits(8)|
+// |added entries(8)|expected max entries(8)|slots(1)|bits(8)|reserved(39)|
 type Metadata struct {
 	Added    uint64
 	Expected uint64
