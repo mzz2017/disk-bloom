@@ -18,8 +18,8 @@ func doubleFNVFactory(salt []byte) func (b []byte) (uint64, uint64) {
 }
 
 const (
-    n         = 1e6
-    expectFPR = 1e-4
+    n         = 1e8
+    expectFPR = 1e-6
 )
 
 bf, err := disk_bloom.NewGroup("testfile*", disk_bloom.FsyncModeEverySec, n, expectFPR, doubleFNVFactory([]byte("some_salt")))
