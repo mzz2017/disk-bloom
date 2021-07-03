@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-const metadataSize = 39
+const metadataSize = 64
 
 var (
 	InvalidPatternErr = fmt.Errorf("invalid pattern")
