@@ -67,7 +67,7 @@ type Controller struct {
 func OptimalParam(n uint64, p float64) (slots uint8, bits uint64) {
 	k := -math.Log(p) * math.Log2E   // number of hashes
 	m := float64(n) * k * math.Log2E // number of bits
-	return uint8(k + 0.5), uint64(m)
+	return uint8(k + 0.5), uint64(m / 8 * 8)
 }
 
 // New creates a classic Bloom Filter.
@@ -189,12 +189,18 @@ func (f *DiskFilter) Exist(b []byte) bool {
 	sort.Slice(offsets, func(i, j int) bool {
 		return offsets[i] < offsets[j]
 	})
+	var m = make(map[int64]byte)
 	f.file.mu.Lock()
 	defer f.file.mu.Unlock()
 	for _, offset := range offsets {
 		var b [1]byte
 		pos := f.fileOffset(int64(offset / 8))
-		f.file.f.ReadAt(b[:], pos)
+		if val, ok := m[pos]; ok {
+			b[0] = val
+		} else {
+			f.file.f.ReadAt(b[:], pos)
+			m[pos] = b[0]
+		}
 		if b[0]&(1<<(offset%8)) == 0 {
 			return false
 		}
@@ -206,7 +212,6 @@ func (f *DiskFilter) Exist(b []byte) bool {
 func (f *DiskFilter) ExistOrAdd(b []byte) (exist bool) {
 	x, y := f.param.Hash(b)
 	var offsets []uint64
-	var newVals [][]byte
 	for i := 0; i < int(f.param.Slots); i++ {
 		offsets = append(offsets, f.bloomOffset(x, y, i))
 	}
@@ -214,25 +219,33 @@ func (f *DiskFilter) ExistOrAdd(b []byte) (exist bool) {
 	sort.Slice(offsets, func(i, j int) bool {
 		return offsets[i] < offsets[j]
 	})
-	newVals = make([][]byte, len(offsets))
+	var m = make(map[int64]byte)
 	f.file.mu.Lock()
 	defer f.file.mu.Unlock()
 	exist = true
-	for i, offset := range offsets {
+	for _, offset := range offsets {
 		var b [1]byte
 		pos := f.fileOffset(int64(offset / 8))
-		f.file.f.ReadAt(b[:], pos)
+		if val, ok := m[pos]; ok {
+			b[0] = val
+		} else {
+			f.file.f.ReadAt(b[:], pos)
+			m[pos] = b[0]
+		}
 		if b[0]&(1<<(offset%8)) == 0 {
 			exist = false
 		}
-		newVals[i] = []byte{b[0] | 1<<(offset%8)}
+		m[pos] |= 1 << (offset % 8)
 	}
 	if exist {
 		return
 	}
-	for i, offset := range offsets {
+	for _, offset := range offsets {
 		pos := f.fileOffset(int64(offset / 8))
-		f.file.f.WriteAt(newVals[i], pos)
+		if val, ok := m[pos]; ok {
+			f.file.f.WriteAt([]byte{val}, pos)
+			delete(m, pos)
+		}
 	}
 	f.file.modified = true
 	return

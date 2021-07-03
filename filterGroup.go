@@ -3,7 +3,6 @@ package disk_bloom
 import (
 	"encoding/binary"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"sync"
@@ -184,7 +183,8 @@ func (g *FilterGroup) ExistOrAdd(b []byte) (exist bool) {
 				return
 			}
 			if err := g.appendNewFilter(); err != nil {
-				log.Println("[error] ExistOrAdd: appendNewFilter:", err)
+				// TODO:
+				// log.Println("[error] ExistOrAdd: appendNewFilter:", err)
 			}
 		}
 	}()
@@ -201,6 +201,8 @@ func (g *FilterGroup) ExistOrAdd(b []byte) (exist bool) {
 
 // Exist returns if an entry is in the filterGroup
 func (g *FilterGroup) Exist(b []byte) (exist bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	for _, f := range g.filters {
 		if f.filter.Exist(b) {
 			return true

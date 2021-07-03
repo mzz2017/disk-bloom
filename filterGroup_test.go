@@ -44,13 +44,13 @@ func TestFilterGroupFalsePositive(t *testing.T) {
 		x := []byte(fmt.Sprint(i))
 		samples[i] = x
 		if bf.ExistOrAdd(x) {
-			fn++
+			fp++// FIXME: not an accurate method
 		}
 	}
 
 	for _, x := range samples {
 		if !bf.Exist(x) {
-			fp++
+			fn++
 		}
 	}
 	fpr := float64(fp) / N
