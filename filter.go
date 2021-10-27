@@ -181,9 +181,9 @@ func (f *DiskFilter) fileOffset(bloomOffset int64) int64 {
 // Exist returns if an entry is in the filter
 func (f *DiskFilter) Exist(b []byte) bool {
 	x, y := f.param.Hash(b)
-	var offsets []uint64
+	var offsets = make([]uint64, f.param.Slots)
 	for i := 0; i < int(f.param.Slots); i++ {
-		offsets = append(offsets, f.bloomOffset(x, y, i))
+		offsets[i] = f.bloomOffset(x, y, i)
 	}
 	// sort to improve the performance on HDD
 	sort.Slice(offsets, func(i, j int) bool {
@@ -211,9 +211,9 @@ func (f *DiskFilter) Exist(b []byte) bool {
 // ExistOrAdd returns whether the entry was in the filter, and adds an entry to the filter if it was not in.
 func (f *DiskFilter) ExistOrAdd(b []byte) (exist bool) {
 	x, y := f.param.Hash(b)
-	var offsets []uint64
+	var offsets = make([]uint64, f.param.Slots)
 	for i := 0; i < int(f.param.Slots); i++ {
-		offsets = append(offsets, f.bloomOffset(x, y, i))
+		offsets[i] = f.bloomOffset(x, y, i)
 	}
 	// sort to improve the performance on HDD
 	sort.Slice(offsets, func(i, j int) bool {
